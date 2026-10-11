@@ -122,25 +122,45 @@ void onenet_property_handle(cJSON *platform_dm_data)
  *================================================================*/
 cJSON *onenet_property_upload(void)
 {
-    //创建JSON根对象（整个上报数据的容器）
     cJSON *root = cJSON_CreateObject();
-    if (root == NULL) return NULL;                                  // 创建失败则返回
-    cJSON_AddStringToObject(root,"id","123");                       // 添加字符串字段："id":"123"
-    cJSON_AddStringToObject(root,"version","1.0");                  // 添加字符串字段："version":"1.0"
-    //创建"params"子对象（存储所有属性）
-    cJSON* params_js = cJSON_AddObjectToObject(root,"params");      
-    
-    //往params中填充灯开关值（简化结构，直接放置值）
-    cJSON_AddBoolToObject(params_js,"LightSwitch",led_status);
-    
-    //往params中填充灯亮度值（简化结构，直接放置值）
-    cJSON_AddNumberToObject(params_js,"Brightness",led_brightness);
-    
-    //往params中填充RGB值（简化结构，直接放置值）
-    cJSON* color_js = cJSON_AddObjectToObject(params_js,"RGBColor");
-    cJSON_AddNumberToObject(color_js,"Red",ws2812_red);
-    cJSON_AddNumberToObject(color_js,"Green",ws2812_green);
-    cJSON_AddNumberToObject(color_js,"Blue",ws2812_blue);
-    
+    if (root == NULL) return NULL;
+    cJSON_AddStringToObject(root, "id", "123");
+    cJSON_AddStringToObject(root, "version", "1.0");
+
+    cJSON *params_js = cJSON_AddObjectToObject(root, "params");
+
+    // LightSwitch：bool，用 value 包裹
+    cJSON *sw = cJSON_AddObjectToObject(params_js, "LightSwitch");
+    cJSON_AddBoolToObject(sw, "value", led_status);
+
+    // Brightness：number，用 value 包裹
+    cJSON *br = cJSON_AddObjectToObject(params_js, "Brightness");
+    cJSON_AddNumberToObject(br, "value", led_brightness);
+
+    // RGBColor：struct，value 本身是对象
+    cJSON *rgb = cJSON_AddObjectToObject(params_js, "RGBColor");
+    cJSON *rgb_value = cJSON_AddObjectToObject(rgb, "value");
+    cJSON_AddNumberToObject(rgb_value, "Red", ws2812_red);
+    cJSON_AddNumberToObject(rgb_value, "Green", ws2812_green);
+    cJSON_AddNumberToObject(rgb_value, "Blue", ws2812_blue);
+
     return root;
+}
+
+
+/*==========================属性获取数据函数========================
+ * @brief:返回当前属性键值对（用于 get_reply 的 data）
+ * @param:无
+ * @return:包含属性值的cJSON对象（需手动释放内存）
+ *================================================================*/
+cJSON *onenet_property_get_data(void)
+{
+    cJSON *data_js = cJSON_CreateObject();
+    cJSON_AddBoolToObject(data_js, "LightSwitch", led_status);
+    cJSON_AddNumberToObject(data_js, "Brightness", led_brightness);
+    cJSON *color = cJSON_AddObjectToObject(data_js, "RGBColor");
+    cJSON_AddNumberToObject(color, "Red", ws2812_red);
+    cJSON_AddNumberToObject(color, "Green", ws2812_green);
+    cJSON_AddNumberToObject(color, "Blue", ws2812_blue);
+    return data_js;
 }

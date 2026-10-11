@@ -123,6 +123,52 @@ static void onenet_mqtt_event_handler(void* event_handler_arg,
                 cJSON_Delete(ack_json);
                 free(ack_str);
             }
+            // 判断是否是物模型属性获取请求（主题包含"/thing/property/get"）
+            if (strstr(event->topic, "/thing/property/get") != NULL) {
+                ESP_LOGI("ONENET", "收到平台属性获取请求：%.*s", event->data_len, event->data);
+
+                char *json_data = malloc(event->data_len + 1);
+                if (json_data == NULL) {
+                    ESP_LOGE("ONENET", "内存分配失败");
+                    break;
+                }
+                memcpy(json_data, event->data, event->data_len);
+                json_data[event->data_len] = '\0';
+
+                cJSON *req = cJSON_Parse(json_data);
+                free(json_data);
+                if (req == NULL) {
+                    ESP_LOGE("ONENET", "JSON解析失败");
+                    break;
+                }
+
+                // 回显请求 id
+                cJSON *id_item = cJSON_GetObjectItem(req, "id");
+                const char *req_id = (id_item && id_item->valuestring) ? id_item->valuestring : "";
+
+                // 构造 get_reply：data 里直接放属性键值对（注意：不是 params）
+                cJSON *reply = cJSON_CreateObject();
+                cJSON_AddStringToObject(reply, "id", req_id);
+                cJSON_AddNumberToObject(reply, "code", 200);
+                cJSON_AddStringToObject(reply, "msg", "success");
+                cJSON_AddItemToObject(reply, "data", onenet_property_get_data());
+
+                char *reply_str = cJSON_Print(reply);
+
+                char reply_topic[128];
+                snprintf(reply_topic, sizeof(reply_topic),
+                         "$sys/%s/%s/thing/property/get_reply",
+                         ONENET_PRODUCT_ID, ONENET_DEVICE_NAME);
+
+                if (mqtt_client_handle != NULL) {
+                    esp_mqtt_client_publish(mqtt_client_handle, reply_topic, reply_str, 0, 1, 0);
+                }
+
+                cJSON_Delete(req);
+                cJSON_Delete(reply);   // 会级联释放 data
+                free(reply_str);
+            }
+
             break;
         case MQTT_EVENT_ERROR:
             ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
@@ -208,6 +254,11 @@ esp_err_t onenet_mqtt_subscribe(void)
     //订阅下行设置属性主题
     snprintf(topic,sizeof(topic),"$sys/%s/%s/thing/property/set",
         ONENET_PRODUCT_ID,ONENET_DEVICE_NAME);
+    esp_mqtt_client_subscribe_single(mqtt_client_handle,topic,1);
+    //订阅设备属性获取主题
+    snprintf(topic,sizeof(topic),"$sys/%s/%s/thing/property/get",
+        ONENET_PRODUCT_ID,ONENET_DEVICE_NAME);
+    esp_mqtt_client_subscribe_single(mqtt_client_handle,topic,1);
     
-    return esp_mqtt_client_subscribe_single(mqtt_client_handle,topic,1);
+    return ESP_OK;
 }
