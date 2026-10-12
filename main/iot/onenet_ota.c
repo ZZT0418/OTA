@@ -13,6 +13,10 @@
 #include <time.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>   // fsync
+#include <errno.h>    // errno
+
+
 
 #define TAG     "onenet_ota"
 
@@ -32,6 +36,12 @@ static char     target_md5[40] = {0};     // 平台给的 md5（32 位 hex）
 static uint32_t target_size = 0;          // 固件总大小
 
 static bool ota_is_running = false;
+
+/* 当前固件下载文件路径：按 md5 隔离，避免新旧固件断点续传时内容拼接 */
+static char ota_file_path[64] = OTA_STORAGE_PATH;
+
+/* MD5 计算函数前向声明（供断点续传下载前校验使用） */
+static esp_err_t calc_file_md5(const char* path, char out_md5[33]);
 
 /* 获取动态时间戳：当前时间 + 1 小时 */
 static uint32_t get_dynamic_timestamp(void)
@@ -174,6 +184,13 @@ esp_err_t onenet_ota_upload_status(int tid, int step)
  */
 static esp_err_t onenet_ota_download_to_file(int tid)
 {
+    // 按固件 md5 生成独立文件名，换固件不会复用旧残留文件
+    if (target_md5[0] != '\0') {
+        snprintf(ota_file_path, sizeof(ota_file_path), "/storage/%.8s.bin", target_md5);
+    }
+    // 顺带清掉旧版固定路径的残留文件，避免占空间
+    remove(OTA_STORAGE_PATH);
+
     char url[256];
     snprintf(url, sizeof(url), ONENET_OTA_URL"/%s/%s/%d/download",
              ONENET_PRODUCT_ID, ONENET_DEVICE_NAME, tid);
@@ -181,18 +198,31 @@ static esp_err_t onenet_ota_download_to_file(int tid)
     // 1. 读已下载字节数
     uint32_t offset = 0;
     struct stat st;
-    if (stat(OTA_STORAGE_PATH, &st) == 0)
+    if (stat(ota_file_path, &st) == 0)
         offset = (uint32_t)st.st_size;
 
     if (target_size > 0 && offset >= target_size) {
-        ESP_LOGI(TAG, "Already fully downloaded");
-        return ESP_OK;
+        // 文件大小已达标，但还需校验 md5，避免把上一个任务残留/损坏的文件误判为已下载完成
+        if (target_md5[0] != '\0') {
+            char local_md5[33];
+            if (calc_file_md5(ota_file_path, local_md5) == ESP_OK &&
+                strcasecmp(local_md5, target_md5) == 0) {
+                ESP_LOGI(TAG, "Already fully downloaded, md5 verified");
+                return ESP_OK;
+            }
+            ESP_LOGW(TAG, "Residual file md5 mismatch, re-download");
+            remove(ota_file_path);
+            offset = 0;
+        } else {
+            ESP_LOGI(TAG, "Already fully downloaded");
+            return ESP_OK;
+        }
     }
 
     // 2. 追加模式打开文件
-    FILE *f = fopen(OTA_STORAGE_PATH, "ab");
+    FILE *f = fopen(ota_file_path, "ab");
     if (f == NULL) {
-        ESP_LOGE(TAG, "Failed to open file");
+        ESP_LOGE(TAG, "Failed to open file: %s (errno=%d)", ota_file_path, errno);
         return ESP_FAIL;
     }
 
@@ -232,7 +262,7 @@ static esp_err_t onenet_ota_download_to_file(int tid)
     if (offset > 0 && esp_http_client_get_status_code(client) != 206) {
         ESP_LOGW(TAG, "Server no resume support, restart from 0");
         fclose(f);
-        f = fopen(OTA_STORAGE_PATH, "wb");
+        f = fopen(ota_file_path, "wb");
         offset = 0;
         if (f == NULL) { esp_http_client_cleanup(client); return ESP_FAIL; }
     }
@@ -242,14 +272,25 @@ static esp_err_t onenet_ota_download_to_file(int tid)
     if (buf == NULL) { fclose(f); esp_http_client_cleanup(client); return ESP_FAIL; }
 
     int len;
+    uint32_t last_sync = 0;
     while ((len = esp_http_client_read(client, (char*)buf, OTA_CHUNK_SIZE)) > 0) {
         fwrite(buf, 1, len, f);
         offset += len;
+
+        // 每累计 64KB 强制落盘一次，保证断电后可断点续传
+        if (offset - last_sync >= 64 * 1024) {
+            fflush(f);
+            fsync(fileno(f));
+            last_sync = offset;
+        }
+
         if (target_size > 0 && (offset % (64 * 1024) < OTA_CHUNK_SIZE)) {
             ESP_LOGI(TAG, "download progress: %lu / %lu", (unsigned long)offset, (unsigned long)target_size);
         }
     }
     free(buf);
+    fflush(f);
+    fsync(fileno(f));   // 最后不足 64KB 的尾数据也确保落盘
     fclose(f);
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
@@ -357,11 +398,11 @@ static void onenet_ota_task(void *param)
 
     if (target_md5[0] != '\0') {                             // 5. MD5 校验
         char local_md5[33];
-        calc_file_md5(OTA_STORAGE_PATH, local_md5);
+        calc_file_md5(ota_file_path, local_md5);
         ESP_LOGI(TAG, "local md5=%s, target md5=%s", local_md5, target_md5);
         if (strcasecmp(local_md5, target_md5) != 0) {
             ESP_LOGE(TAG, "md5 mismatch, delete file");
-            remove(OTA_STORAGE_PATH);
+            remove(ota_file_path);
             goto done;
         }
         ESP_LOGI(TAG, "md5 verify OK");
@@ -369,11 +410,11 @@ static void onenet_ota_task(void *param)
 
     onenet_ota_upload_status(task_id, 50);                   // 6. 上报：开始写入
 
-    ret = ota_write_from_file(OTA_STORAGE_PATH);             // 7. 写 OTA 分区
+    ret = ota_write_from_file(ota_file_path);                // 7. 写 OTA 分区
     if (ret != ESP_OK) { ESP_LOGE(TAG, "write ota fail"); goto done; }
 
     onenet_ota_upload_status(task_id, 100);                  // 8. 上报：完成
-    remove(OTA_STORAGE_PATH);                                // 清理临时文件
+    remove(ota_file_path);                                   // 清理临时文件
 
     ESP_LOGI(TAG, "OTA success, reboot...");
     vTaskDelay(pdMS_TO_TICKS(2000));

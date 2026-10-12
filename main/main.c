@@ -91,6 +91,7 @@ void app_main(void)
             sntp_time_init();   // 先对时，再启动 MQTT（否则 token 时间戳无效）
             mount_storage();    // 挂载文件系统
             onenet_mqqt_start();
+            onenet_ota_start(); // 启动后主动检查升级任务，断电重启后可立即续传
          }
     }
 }
