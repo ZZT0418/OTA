@@ -7,6 +7,7 @@
 #include "mqtt_client.h"
 #include "onenet_token.h"
 #include "onenet_dm.h"              //引入物模型相关头文件
+#include "onenet_ota.h"             //引入OTA相关头文件
 
 #define TAG     "onenet_mqtt"
 
@@ -46,6 +47,7 @@ static void onenet_mqtt_event_handler(void* event_handler_arg,
                 cJSON_Delete(data);                         //删除cjson对象
                 free(json_str);                             //释放内存
            }
+           onenet_ota_upload_version();                       //上报版本号
             break;
         case MQTT_EVENT_DISCONNECTED:   //连接断开
             ESP_LOGI(TAG, "Onenet mqtt disconnected");
@@ -124,7 +126,7 @@ static void onenet_mqtt_event_handler(void* event_handler_arg,
                 free(ack_str);
             }
             // 判断是否是物模型属性获取请求（主题包含"/thing/property/get"）
-            if (strstr(event->topic, "/thing/property/get") != NULL) {
+            else if (strstr(event->topic, "/thing/property/get") != NULL) {
                 ESP_LOGI("ONENET", "收到平台属性获取请求：%.*s", event->data_len, event->data);
 
                 char *json_data = malloc(event->data_len + 1);
@@ -168,7 +170,14 @@ static void onenet_mqtt_event_handler(void* event_handler_arg,
                 cJSON_Delete(reply);   // 会级联释放 data
                 free(reply_str);
             }
-
+            else if (strstr(event->topic, "/ota/inform") != NULL) {
+                cJSON *ota_js = cJSON_Parse(event->data);
+                cJSON *id_js = cJSON_GetObjectItem(ota_js,"id");
+                onenet_ota_ack(cJSON_GetStringValue(id_js),200,"success");
+                cJSON_Delete(ota_js);
+                // 开始OTA升级
+                onenet_ota_start();
+            }
             break;
         case MQTT_EVENT_ERROR:
             ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
@@ -199,7 +208,7 @@ esp_err_t onenet_mqqt_start(void)
                                     1924833600,                     //token的过期时间       
                                     ONENET_PRODUCT_ID,              //产品ID    
                                     ONENET_DEVICE_NAME,             //设备名称
-                                    ONETNET_ACCESS_KEY);            //访问密钥
+                                    ONENET_ACCESS_KEY);            //访问密钥
     
     if (result != 0) {
         ESP_LOGE(TAG, "Failed to generate token, error code: %d", result);
@@ -259,6 +268,32 @@ esp_err_t onenet_mqtt_subscribe(void)
     snprintf(topic,sizeof(topic),"$sys/%s/%s/thing/property/get",
         ONENET_PRODUCT_ID,ONENET_DEVICE_NAME);
     esp_mqtt_client_subscribe_single(mqtt_client_handle,topic,1);
-    
+    //订阅OTA升级主题
+    snprintf(topic,sizeof(topic),"$sys/%s/%s/ota/inform",
+        ONENET_PRODUCT_ID,ONENET_DEVICE_NAME);
+    esp_mqtt_client_subscribe_single(mqtt_client_handle,topic,1);
+
     return ESP_OK;
 }
+
+/**
+ * 返回OTA确认
+ * @param code 错误码
+ * @param message 信息
+ * @return mqtt连接参数
+ */
+void onenet_ota_ack(const char* id,int code,const char* message)
+{
+    char topic[128];
+    snprintf(topic,sizeof(topic),"$sys/%s/%s/ota/inform_reply",ONENET_PRODUCT_ID,ONENET_DEVICE_NAME);
+
+    cJSON *reply_js = cJSON_CreateObject();
+    cJSON_AddStringToObject(reply_js,"id",id);
+    cJSON_AddNumberToObject(reply_js,"code",code);
+    cJSON_AddStringToObject(reply_js,"message",message);
+    char* data = cJSON_PrintUnformatted(reply_js);
+    esp_mqtt_client_publish(mqtt_client_handle,topic,data,strlen(data),1,0); 
+    cJSON_free(data);
+    cJSON_Delete(reply_js);
+}
+
