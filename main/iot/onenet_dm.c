@@ -28,6 +28,14 @@ void onenet_dm_init(void)
 {
     //初始化ws2812
     ws2812_init(GPIO_NUM_18,3,&ws2812_handle);
+    //默认上电显示蓝色灯光（R=0, G=0, B=255）
+    ws2812_red = 0;
+    ws2812_green = 0;
+    ws2812_blue = 255;
+    for (int i = 0; i < 3; i++)
+    {
+        ws2812_write(ws2812_handle, i, ws2812_red, ws2812_green, ws2812_blue);
+    }
     //初始化并配置ledc定时器
     ledc_timer_config_t ledc_timer = 
     { 
