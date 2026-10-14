@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "cJSON.h"
 #include "esp_ota_ops.h"
+#include "esp_delta_ota.h"
 #include "esp_crt_bundle.h"
 #include "mbedtls/md5.h"
 #include <sys/stat.h>
@@ -15,6 +16,7 @@
 #include <strings.h>
 #include <unistd.h>   // fsync
 #include <errno.h>    // errno
+
 
 
 
@@ -34,6 +36,7 @@ static int      task_id = 0;
 static char     target_version[16] = {0};
 static char     target_md5[40] = {0};     // 平台给的 md5（32 位 hex）
 static uint32_t target_size = 0;          // 固件总大小
+static int      ota_package_type = 1;     // 平台下发包类型：1=完整包，2=差分包（默认按完整包兜底）
 
 static bool ota_is_running = false;
 
@@ -140,14 +143,21 @@ esp_err_t onenet_ota_check_task(const char* type, const char* version)
                 cJSON* tid_js    = cJSON_GetObjectItem(data_js, "tid");
                 cJSON* size_js   = cJSON_GetObjectItem(data_js, "size");
                 cJSON* md5_js    = cJSON_GetObjectItem(data_js, "md5");
+                cJSON* type_js   = cJSON_GetObjectItem(data_js, "type");
 
                 if (target_js && tid_js) {
                     snprintf(target_version, sizeof(target_version), "%s", cJSON_GetStringValue(target_js));
                     task_id = (int)cJSON_GetNumberValue(tid_js);
                     if (size_js) target_size = (uint32_t)cJSON_GetNumberValue(size_js);
                     if (md5_js)  snprintf(target_md5, sizeof(target_md5), "%s", cJSON_GetStringValue(md5_js));
-                    ESP_LOGI(TAG, "task: target=%s tid=%d size=%lu md5=%s",
-                             target_version, task_id, (unsigned long)target_size, target_md5);
+                    // 包类型：1=完整包，2=差分包（平台未返回时默认按完整包处理）
+                    if (type_js && cJSON_IsNumber(type_js))
+                        ota_package_type = (int)cJSON_GetNumberValue(type_js);
+                    else
+                        ota_package_type = 1;
+                    ESP_LOGI(TAG, "task: target=%s tid=%d size=%lu md5=%s pkg_type=%d(%s)",
+                             target_version, task_id, (unsigned long)target_size, target_md5,
+                             ota_package_type, ota_package_type == 2 ? "delta" : "full");
                     ret = ESP_OK;
                 }
             }
@@ -380,6 +390,100 @@ static esp_err_t ota_write_from_file(const char* path)
     return err;
 }
 
+/* ==================== 差分还原：差分包 + 旧固件 -> 新固件写 OTA 分区 ==================== */
+
+/* 读回调：从「当前运行分区」读旧固件数据（src_offset 是差分引擎要求的偏移） */
+static esp_err_t delta_read_old_image(uint8_t *buf, size_t size, int src_offset, void *user_data)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    return esp_partition_read(running, src_offset, buf, size);
+}
+
+/* 写回调：把还原出的新固件写入 OTA 分区 */
+static esp_err_t delta_write_new_image(const uint8_t *buf, size_t size, void *user_data)
+{
+    esp_ota_handle_t *handle = (esp_ota_handle_t *)user_data;
+    return esp_ota_write(*handle, buf, size);
+}
+
+/* 从差分包文件还原新固件到 OTA 分区 */
+static esp_err_t delta_ota_from_file(const char *path)
+{
+    const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
+    if (update == NULL) {
+        ESP_LOGE(TAG, "No OTA partition");
+        return ESP_FAIL;
+    }
+
+    esp_ota_handle_t ota_handle = 0;
+    esp_err_t err = esp_ota_begin(update, OTA_SIZE_UNKNOWN, &ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ota begin fail: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    esp_delta_ota_cfg_t cfg = {
+        .read_cb_with_user_data  = delta_read_old_image,   // 读旧固件
+        .write_cb_with_user_data = delta_write_new_image,  // 写新固件
+        .user_data = &ota_handle,
+    };
+    esp_delta_ota_handle_t dh = esp_delta_ota_init(&cfg);
+    if (dh == NULL) {
+        ESP_LOGE(TAG, "delta ota init fail");
+        esp_ota_abort(ota_handle);
+        return ESP_FAIL;
+    }
+
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "open patch file fail");
+        esp_delta_ota_deinit(dh);
+        esp_ota_abort(ota_handle);
+        return ESP_FAIL;
+    }
+
+    uint8_t *buf = malloc(OTA_CHUNK_SIZE);
+    if (buf == NULL) {
+        fclose(f);
+        esp_delta_ota_deinit(dh);
+        esp_ota_abort(ota_handle);
+        return ESP_FAIL;
+    }
+
+    size_t n;
+    while ((n = fread(buf, 1, OTA_CHUNK_SIZE, f)) > 0) {
+        err = esp_delta_ota_feed_patch(dh, buf, n);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "feed patch fail: %s", esp_err_to_name(err));
+            break;
+        }
+    }
+    free(buf);
+    fclose(f);
+
+    if (err == ESP_OK) {
+        err = esp_delta_ota_finalize(dh);
+    }
+    esp_delta_ota_deinit(dh);
+
+    if (err != ESP_OK) {
+        esp_ota_abort(ota_handle);
+        return err;
+    }
+
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ota end fail: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = esp_ota_set_boot_partition(update);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "set boot partition fail: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
 /* ==================== OTA 主流程任务 ==================== */
 static void onenet_ota_task(void *param)
 {
@@ -390,6 +494,12 @@ static void onenet_ota_task(void *param)
 
     ret = onenet_ota_check_task("1", get_app_verion());      // 2. 检查任务
     if (ret != ESP_OK) { ESP_LOGE(TAG, "check task fail"); goto done; }
+
+    // 2.5 保险：目标版本 == 当前版本时跳过，防止重复打补丁写坏固件
+    if (strcmp(target_version, get_app_verion()) == 0) {
+        ESP_LOGW(TAG, "already at target version %s, skip", target_version);
+        goto done;
+    }
 
     onenet_ota_upload_status(task_id, 10);                   // 3. 上报：开始下载
 
@@ -410,7 +520,11 @@ static void onenet_ota_task(void *param)
 
     onenet_ota_upload_status(task_id, 50);                   // 6. 上报：开始写入
 
-    ret = ota_write_from_file(ota_file_path);                // 7. 写 OTA 分区
+    if (ota_package_type == 2) {
+        ret = delta_ota_from_file(ota_file_path);            // 7a. 差分包：差分还原写 OTA 分区
+    } else {
+        ret = ota_write_from_file(ota_file_path);            // 7b. 完整包：直接写 OTA 分区
+    }
     if (ret != ESP_OK) { ESP_LOGE(TAG, "write ota fail"); goto done; }
 
     onenet_ota_upload_status(task_id, 100);                  // 8. 上报：完成
