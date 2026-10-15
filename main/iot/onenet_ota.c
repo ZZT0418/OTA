@@ -10,6 +10,8 @@
 #include "esp_delta_ota.h"
 #include "esp_crt_bundle.h"
 #include "mbedtls/md5.h"
+#include "mbedtls/pk.h"
+#include "mbedtls/sha256.h"
 #include <sys/stat.h>
 #include <time.h>
 #include <string.h>
@@ -343,6 +345,40 @@ static esp_err_t calc_file_md5(const char* path, char out_md5[33])
     return ESP_OK;
 }
 
+/* ==================== 固件签名验签 ==================== */
+
+/* ECDSA 公钥（PEM 格式，内容来自 ec_public.pem） */
+static const char public_key_pem[] =
+    "-----BEGIN PUBLIC KEY-----\n"
+    "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEEChlqMZyM2ZBVtSxcPKu5BBfK86f\n"
+    "9yOyZQ0rPiGvGOhmNwH/tTdsAIcP8nHEz5R3DTara7RQ6NsmistCimG5ww==\n"
+    "-----END PUBLIC KEY-----\n";
+
+#define SIGNATURE_SIZE  72   // ECDSA secp256r1 DER 签名固定 72 字节
+
+/* 验签：data 是升级包内容，sig 是末尾 72 字节 DER 签名 */
+static esp_err_t verify_firmware_signature(const uint8_t *data, size_t data_len,
+                                           const uint8_t *sig, size_t sig_len)
+{
+    uint8_t hash[32];
+    mbedtls_sha256(data, data_len, hash, 0);   // 1. 计算 SHA256
+
+    mbedtls_pk_context pk;
+    mbedtls_pk_init(&pk);
+    int ret = mbedtls_pk_parse_public_key(&pk,
+                (const unsigned char *)public_key_pem, sizeof(public_key_pem));
+    if (ret != 0) {
+        ESP_LOGE(TAG, "parse pubkey fail: -0x%04x", (unsigned int)-ret);
+        mbedtls_pk_free(&pk);
+        return ESP_FAIL;
+    }
+
+    ret = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, 32, sig, sig_len);  // 2. DER 验签
+    mbedtls_pk_free(&pk);
+    return (ret == 0) ? ESP_OK : ESP_FAIL;
+}
+
+
 /* ==================== 写文件到 OTA 分区 ==================== */
 static esp_err_t ota_write_from_file(const char* path)
 {
@@ -517,6 +553,32 @@ static void onenet_ota_task(void *param)
         }
         ESP_LOGI(TAG, "md5 verify OK");
     }
+
+        /* 5.5 固件签名验签（拆出「升级包」和「末尾 64 字节签名」） */
+    {
+        struct stat st;
+        if (stat(ota_file_path, &st) != 0) { ESP_LOGE(TAG, "stat fail"); goto done; }
+        if (st.st_size <= SIGNATURE_SIZE) { ESP_LOGE(TAG, "file too small"); goto done; }
+
+        uint8_t *buf = malloc(st.st_size);
+        if (buf == NULL) { ESP_LOGE(TAG, "malloc fail"); goto done; }
+
+        FILE *f = fopen(ota_file_path, "rb");
+        if (f == NULL) { free(buf); ESP_LOGE(TAG, "open fail"); goto done; }
+        fread(buf, 1, st.st_size, f);
+        fclose(f);
+
+        size_t pkg_size = st.st_size - SIGNATURE_SIZE;
+        if (verify_firmware_signature(buf, pkg_size, buf + pkg_size, SIGNATURE_SIZE) != ESP_OK) {
+            ESP_LOGE(TAG, "signature verify fail, reject upgrade");
+            free(buf);
+            remove(ota_file_path);
+            goto done;
+        }
+        free(buf);
+        ESP_LOGI(TAG, "signature verify OK");
+    }
+
 
     onenet_ota_upload_status(task_id, 50);                   // 6. 上报：开始写入
 
